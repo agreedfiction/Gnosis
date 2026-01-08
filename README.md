@@ -218,7 +218,19 @@ Outputs are saved in:
 
 ---
 
-## star history
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Amirhosein-gh98/Gnosis&type=Date)](https://www.star-history.com/#Amirhosein-gh98/Gnosis&Date)
+
+## Citation
+If you find our work useful, please consider citing our paper in your research.
+
+```
+@article{ghasemabadi2025can,
+  title={Can LLMs Predict Their Own Failures? Self-Awareness via Internal Circuits},
+  author={Ghasemabadi, Amirhosein and Niu, Di},
+  journal={arXiv preprint arXiv:2512.20578},
+  year={2025}
+}
+```

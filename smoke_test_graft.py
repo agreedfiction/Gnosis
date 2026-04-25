@@ -3,6 +3,9 @@ import time
 import sys
 import os
 
+# Bypass broken cuDNN in this conda environment (same fix as extract_gnosis_data.py)
+torch.backends.cudnn.enabled = False
+
 # Force local transformers
 local_transformers_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "transformers/src"))
 if local_transformers_path not in sys.path:

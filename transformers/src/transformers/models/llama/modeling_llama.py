@@ -50,9 +50,14 @@ from ...models.qwen3.feature_extractors import (
     ConfFeatureExtractorLite,
     HiddenFeatureExtractorLite,
     CorrectnessHeadLite,
-    _safe_dtype_param,
 )
 import torch.nn.functional as F
+
+def _safe_dtype_param(module: nn.Module) -> torch.dtype:
+    """Return the dtype of the first parameter in module, defaulting to bfloat16."""
+    for p in module.parameters():
+        return p.dtype
+    return torch.bfloat16
 
 
 logger = logging.get_logger(__name__)

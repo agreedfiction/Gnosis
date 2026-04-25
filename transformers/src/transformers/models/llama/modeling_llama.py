@@ -45,6 +45,15 @@ from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import check_model_inputs
 from .configuration_llama import LlamaConfig
 
+from ...models.qwen3.feature_extractors import (
+    AttnFeatureExtractorLite_D3,
+    ConfFeatureExtractorLite,
+    HiddenFeatureExtractorLite,
+    CorrectnessHeadLite,
+    _safe_dtype_param,
+)
+import torch.nn.functional as F
+
 
 logger = logging.get_logger(__name__)
 
@@ -421,8 +430,174 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # ---- feature toggles (simple booleans) ----
+        self.use_stop_attn = bool(getattr(config, "use_stop_attn", True))
+        self.use_stop_conf = bool(getattr(config, "use_stop_conf", False))
+        self.use_stop_hid  = bool(getattr(config, "use_stop_hid",  True))
+
+        # ---- dims (safe defaults) ----
+        D_ATT  = int(getattr(config, "stop_att_dim", 256))
+        D_CONF = int(getattr(config, "stop_conf_dim", 128))
+        D_HID  = int(getattr(config, "stop_hid_dim", 256))
+
+        k_conf = int(getattr(config, "stop_k_conf", 192))
+        k_hid  = int(getattr(config, "stop_k_hid", 192))
+
+        max_layers = int(getattr(config, "num_hidden_layers", 32))
+        max_heads  = int(getattr(config, "num_attention_heads", 32))
+
+        self._custom_head_names = []
+
+        if self.use_stop_attn:
+            self.attn_extractor = AttnFeatureExtractorLite_D3(
+                D_ATT=D_ATT,
+                d_grid=192,
+                cnn_channels=(32, 64, 128),
+                grid_conv_layers=6,
+                K=8,
+                pdrop=0.10,
+                max_layers=max_layers,
+                max_heads=max_heads,
+                feature_mode="both",
+                stats_groups=("all",),
+                spec_radii=(0.15, 0.35, 0.60),
+                band_widths=(None, None),
+            )
+            self._custom_head_names.append("attn_extractor")
+        else:
+            self.attn_extractor = None
+
+        if self.use_stop_conf:
+            self.conf_extractor = ConfFeatureExtractorLite(
+                D_CONF=D_CONF,
+                d_tok=128,
+                k_conf=k_conf,
+                base_c=64,
+                K=3,
+                sab_layers=2,
+                sab_heads=4,
+                pdrop=0.10,
+            )
+            self._custom_head_names.append("conf_extractor")
+        else:
+            self.conf_extractor = None
+
+        if self.use_stop_hid:
+            self.hid_extractor = HiddenFeatureExtractorLite(
+                D_model=config.hidden_size,
+                D_HID=D_HID,
+                d_tok=192,
+                k_hid=k_hid,
+                groups=8,
+                K=3,
+                sab_layers=3,
+                sab_heads=8,
+                pdrop=0.10,
+                se_reduction=8,
+            )
+            self._custom_head_names.append("hid_extractor")
+        else:
+            self.hid_extractor = None
+
+        self.stop_head = CorrectnessHeadLite(
+            D_ATT=D_ATT, D_CONF=D_CONF, D_HID=D_HID, pdrop=0.10,
+            use_attn=self.use_stop_attn, use_conf=self.use_stop_conf, use_hid=self.use_stop_hid,
+        )
+        self._custom_head_names.append("stop_head")
+
         # Initialize weights and apply final processing
         self.post_init()
+
+        # freeze base; train only aux modules that exist
+        trainable_prefixes = tuple(self._custom_head_names)
+        for n, p in self.named_parameters():
+            if n.startswith(trainable_prefixes):
+                p.requires_grad_(True)
+            else:
+                p.requires_grad_(False)
+
+    # ----------------------------------------------------------------------------------
+    # Aux correctness scorer (returns sequence-level probability; shape (B,1))
+    # ----------------------------------------------------------------------------------
+    def _should_stop(
+        self,
+        last_hidden: torch.Tensor,
+        attn_stack: list[torch.Tensor] | None,
+        token_probs: torch.Tensor,
+        mask: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, S, _ = last_hidden.shape
+        out_dtype = _safe_dtype_param(self.stop_head)
+
+        token_probs_s = torch.clamp(torch.nan_to_num(token_probs, nan=1.0, posinf=1.0, neginf=1e-8), 1e-8, 1.0)
+        last_hidden_s = torch.nan_to_num(last_hidden, nan=0.0, posinf=0.0, neginf=0.0)
+
+        A = None
+        if self.use_stop_attn:
+            if attn_stack is None or len(attn_stack) == 0:
+                raise RuntimeError("use_stop_attn=True but no reduced attentions were provided.")
+            with torch.no_grad():
+                A = torch.stack(attn_stack, dim=1).detach()
+                if A.dim() != 5 or A.shape[-1] != A.shape[-2]:
+                    raise RuntimeError(f"Expected reduced attn (B,L,H,k,k), got {tuple(A.shape)}")
+                A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+            z_att = None
+            z_conf = None
+            z_hid = None
+            if self.use_stop_attn:
+                z_att = self.attn_extractor(A.to(_safe_dtype_param(self.attn_extractor)))
+            if self.use_stop_conf:
+                z_conf = self.conf_extractor(token_probs_s.to(_safe_dtype_param(self.conf_extractor)))
+            if self.use_stop_hid:
+                z_hid  = self.hid_extractor(last_hidden_s.to(_safe_dtype_param(self.hid_extractor)))
+
+            if z_att  is not None: z_att  = torch.nan_to_num(z_att,  nan=0.0, posinf=0.0, neginf=0.0)
+            if z_conf is not None: z_conf = torch.nan_to_num(z_conf, nan=0.0, posinf=0.0, neginf=0.0)
+            if z_hid  is not None: z_hid  = torch.nan_to_num(z_hid,  nan=0.0, posinf=0.0, neginf=0.0)
+
+            logits = self.stop_head(
+                z_att.to(out_dtype)  if z_att  is not None else None,
+                z_conf.to(out_dtype) if z_conf is not None else None,
+                z_hid.to(out_dtype)  if z_hid  is not None else None,
+            )
+
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        with torch.amp.autocast("cuda", enabled=False):
+            probs = torch.sigmoid(logits.to(torch.float32))
+        probs = torch.clamp(torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0), 1e-6, 1.0 - 1e-6).to(out_dtype)
+        return probs
+
+    # Correctness BCE loss
+    def compute_stop_loss(
+        self,
+        probs_seq: torch.Tensor,
+        correctness_label: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if probs_seq.dim() == 2 and probs_seq.size(-1) == 1:
+            probs_seq = probs_seq.squeeze(-1)
+        probs = torch.nan_to_num(probs_seq.float(), nan=0.5)
+        probs = probs.clamp(min=eps, max=1.0 - eps)
+
+        labels = correctness_label
+        if labels.dim() == 2 and labels.size(-1) == 1:
+            labels = labels.squeeze(-1)
+        labels = torch.nan_to_num(labels.float(), nan=0.0)
+
+        keep = labels.ne(-1.0)
+        if not torch.any(keep):
+            return probs.sum() * 0.0
+
+        y = labels[keep].clamp_(0.0, 1.0)
+        p = probs[keep]
+
+        loss = F.binary_cross_entropy(p, y, reduction="mean")
+        if not torch.isfinite(loss):
+            loss = probs.sum() * 0.0
+        return loss
 
     @can_return_tuple
     @auto_docstring
@@ -435,27 +610,25 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        apply_budget: Optional[bool] = None,
+        correctness_label: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
-        Example:
+        CausalLMOutputWithPast with an extra field `stop_prob` (B,1) when computed.
+        """
+        output_attentions = (
+            True if (self.training or apply_budget)
+            else (self.config.output_attentions if output_attentions is None else output_attentions)
+        )
+        if getattr(self, "use_stop_attn", False) != True:
+            output_attentions = False
+        output_hidden_states = False
 
-        ```python
-        >>> from transformers import AutoTokenizer, LlamaForCausalLM
-
-        >>> model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -463,26 +636,72 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=False,
             cache_position=cache_position,
             **kwargs,
         )
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        hidden_full = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_full[:, slice_indices, :])
 
         loss = None
-        if labels is not None:
+        if labels is not None and correctness_label is None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
+        hidden_for_head = hidden_full[:, :-1, :]
+        B, S_hid, _ = hidden_for_head.shape
+        if attention_mask is not None:
+            mask = attention_mask[:, :S_hid].float()
+        else:
+            mask = torch.ones((B, S_hid), device=hidden_for_head.device, dtype=torch.float)
+
+        stop_prob = None
+        if self.training and correctness_label is not None:
+            logits_step = self.lm_head(hidden_full)
+            logits_step = logits_step[:, :-1, :] if logits_step.size(1) == labels.size(1) + 1 else logits_step
+            logp = torch.log_softmax(logits_step.float(), dim=-1)
+            tgt = labels.clamp(min=0)
+            log_tok_p = logp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+            log_tok_p = torch.where(labels.eq(-100), torch.zeros_like(log_tok_p), log_tok_p)
+            token_probs_so_far = torch.clamp(log_tok_p.exp(), min=1e-8).to(logits_step.dtype).detach()
+            
+            attn_stack = outputs.attentions
+
+            stop_prob = self._should_stop(
+                last_hidden=hidden_for_head,
+                attn_stack=attn_stack,
+                token_probs=token_probs_so_far[:, :-1] if token_probs_so_far.size(1) > S_hid else token_probs_so_far,
+                mask=mask,
+                input_ids=input_ids[:, :S_hid] if input_ids is not None else None,
+            )
+
+            loss = self.compute_stop_loss(stop_prob, correctness_label)
+
+        if apply_budget and not self.training:
+            attn_stack = outputs.attentions
+            # In inference without labels, pass dummy token probs 
+            dummy_probs = torch.ones((B, S_hid), device=hidden_for_head.device, dtype=hidden_for_head.dtype)
+            stop_prob = self._should_stop(
+                last_hidden=hidden_for_head,
+                attn_stack=attn_stack,
+                token_probs=dummy_probs,
+                mask=mask,
+                input_ids=input_ids[:, :S_hid] if input_ids is not None else None,
+            )
+
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        if stop_prob is not None:
+            output.stop_prob = stop_prob.detach() if not self.training else stop_prob
+            
+        return output
 
 
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...

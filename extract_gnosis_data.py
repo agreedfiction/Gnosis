@@ -1,12 +1,33 @@
 import os
+import sys
+
+# CRITICAL: Force Python to use the local Gnosis transformers branch.
+# We must clear any already-loaded transformers from the Anaconda environment
+# so that the local branch's Qwen3ForCausalLM (which has `_should_stop`) is used.
+local_transformers_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "transformers/src"))
+if local_transformers_path not in sys.path:
+    sys.path.insert(0, local_transformers_path)
+for key in list(sys.modules.keys()):
+    if key.startswith("transformers"):
+        del sys.modules[key]
+
 import argparse
 import pandas as pd
 import torch
+
+# Bypass cuDNN initialization bugs in the current conda environment
+torch.backends.cudnn.enabled = False
+
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from datasets import load_dataset
 from tqdm import tqdm
+
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+import transformers
+
+transformers.Qwen3ForCausalLM = Qwen3ForCausalLM
 
 def setup_distributed():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -79,7 +100,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
+        trust_remote_code=False,
         use_cache=False,
     ).to(device).eval()
 

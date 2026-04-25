@@ -498,7 +498,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 sab_layers=3,
                 sab_heads=8,
                 pdrop=0.10,
-                se_reduction=8,
             )
             self._custom_head_names.append("hid_extractor")
         else:

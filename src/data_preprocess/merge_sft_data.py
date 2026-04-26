@@ -763,6 +763,28 @@ def main():
     # _save_csv(per_q_after, out_dir / "per_question_after.csv")
     # _save_csv(cat_after, out_dir / "category_counts_after.csv")
 
+    # ── Also save as HuggingFace dataset (needed by grpo_general.py → load_from_disk) ──
+    # grpo_general.py calls:  raw = load_from_disk(dataset_path)
+    # load_from_disk() requires an HF dataset saved with save_to_disk(), not a raw parquet.
+    # We save the same data as a DatasetDict {"train": ...} so GRPO can consume it directly.
+    try:
+        from datasets import Dataset as HFDataset, DatasetDict as HFDatasetDict
+        df_for_hf = _coerce_for_storage(df_final)
+        # Ensure all object columns are plain strings (Arrow-safe)
+        for col in df_for_hf.columns:
+            if df_for_hf[col].dtype == object:
+                df_for_hf[col] = df_for_hf[col].astype(str)
+        hf_dataset = HFDataset.from_pandas(df_for_hf, preserve_index=False)
+        hf_datasetdict = HFDatasetDict({"train": hf_dataset})
+        hf_save_path = out_dir / "hf_dataset"
+        hf_datasetdict.save_to_disk(str(hf_save_path))
+        print(f"\n[HF dataset] Saved to: {hf_save_path}")
+        print(f"  → Set dataset_path: {hf_save_path} in your YAML recipe.")
+    except Exception as _hf_err:
+        print(f"[warn] Could not save HF dataset format: {_hf_err}")
+        print("       grpo_general.py requires load_from_disk(); re-run with datasets>=2.0 installed.")
+    # ─────────────────────────────────────────────────────────────────────────────────────
+
     # Distributions of completions per question
     def _dist(series: pd.Series) -> Dict[str, int]:
         vc = series.value_counts().sort_index()

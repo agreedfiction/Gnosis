@@ -168,6 +168,12 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The group to store runs under.")},
     )
+    # Dataset path for on-disk HF datasets (used by grpo_general.py)
+    dataset_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a local HuggingFace dataset saved with save_to_disk(). "
+                          "Set this in your YAML recipe instead of hardcoding in the script."},
+    )
 
 
 @dataclass

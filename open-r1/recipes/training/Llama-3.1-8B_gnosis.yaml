@@ -1,0 +1,82 @@
+# ============================================================
+# IntrospectRL — Llama-3.1-8B Correctness Head Training Recipe
+# Phase 3: Correctness head only (freeze_except_stop_head=true)
+# ============================================================
+
+# ── Model ────────────────────────────────────────────────────
+model_name_or_path: meta-llama/Meta-Llama-3.1-8B-Instruct
+# If a local checkpoint exists, override here:
+#   model_name_or_path: /mnt/vaultb/models/Meta-Llama-3.1-8B-Instruct
+model_revision: main
+torch_dtype: bfloat16
+
+# CRITICAL: must be "eager" — sdpa/flash_attention_2 silently drops
+# output_attentions, causing attn_stack=None → RuntimeError in _should_stop
+attn_implementation: eager
+
+# ── Dataset ──────────────────────────────────────────────────
+# Set this to the actual path of your merged training dataset on the server.
+# Candidate paths to check (run: ls /mnt/vaultb/Aditya_Manik/ and ls /merged_qa_dataset):
+#   /mnt/vaultb/Aditya_Manik/Gnosis/data/merged_qa_dataset
+#   /mnt/vaultb/datasets/merged_qa_dataset
+#   /merged_qa_dataset
+dataset_path: /mnt/vaultb/Aditya_Manik/Gnosis/data/merged_qa_dataset
+
+dataset_num_proc: 16
+
+# ── IntrospectRL Head Flags ───────────────────────────────────
+enable_correctness_head: true
+freeze_except_stop_head: true   # Phase 3: train only head, not backbone
+lambda_stop: 1.0
+correctness_last_k: 10
+
+# ── GRPO Core ────────────────────────────────────────────────
+reward_funcs:
+  - accuracy
+  - format
+
+num_generations: 4              # Keep low for head-only first run
+max_prompt_length: 512
+max_completion_length: 512      # Shorter = less VRAM for eager attn maps
+
+# ── Training ─────────────────────────────────────────────────
+bf16: true
+do_eval: false
+eval_strategy: "no"
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+learning_rate: 5.0e-5
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+warmup_ratio: 0.05
+
+max_steps: 200                  # Tiny dry run — override to -1 for full training
+num_train_epochs: 1
+
+# ── Logging & Saving ─────────────────────────────────────────
+output_dir: output/Llama-3.1-8B_gnosis_phase3
+run_name: Llama-3.1-8B_gnosis_phase3
+overwrite_output_dir: true
+
+log_level: info
+logging_steps: 1
+logging_strategy: steps
+
+save_strategy: "steps"
+save_steps: 100
+save_total_limit: 2
+
+report_to:
+  - none                        # Switch to wandb once dry run passes
+
+# ── Misc ─────────────────────────────────────────────────────
+seed: 42
+use_liger_kernel: false         # incompatible with correctness head path
+beta: 0.0                       # no KL penalty (no ref model needed for head training)
+scale_rewards: "group"

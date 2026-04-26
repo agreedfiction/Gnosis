@@ -15,7 +15,26 @@ accelerate launch --config_file <accelerate_zero_config>.yaml \
 
 """
 
+# ── CRITICAL: Force local Gnosis transformers branch ────────────────────────
+# Must happen before any transformers import so the grafted LlamaForCausalLM
+# (with CorrectnessHeadLite) is used instead of the Anaconda site-packages copy.
+import sys as _sys
+import os as _os
+_gnosis_root = _os.path.abspath(
+    _os.path.join(_os.path.dirname(__file__), "../../../../../")
+)
+_local_tf = _os.path.join(_gnosis_root, "transformers", "src")
+if _local_tf not in _sys.path:
+    _sys.path.insert(0, _local_tf)
+# Eject any already-cached transformers to force reload from local branch
+for _k in list(_sys.modules.keys()):
+    if _k.startswith("transformers"):
+        del _sys.modules[_k]
 
+import torch as _torch
+# Bypass broken cuDNN in this conda environment (same fix as extract_gnosis_data.py)
+_torch.backends.cudnn.enabled = False
+# ── End path injection ───────────────────────────────────────────────────────
 
 import logging
 import os
@@ -32,7 +51,6 @@ from open_r1.utils import get_dataset, get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
-# add near other imports
 from open_r1.parallelism_config import ParallelismConfig
 import torch
 from datasets import load_from_disk, Dataset, DatasetDict
@@ -82,8 +100,28 @@ def main(script_args, training_args, model_args):
 
     # -----------------------------
     # Load the merged dataset (from disk)
+    # dataset_path must be set in your YAML recipe (e.g., dataset_path: /mnt/vaultb/...)
+    # Candidate paths on server:
+    #   /mnt/vaultb/Aditya_Manik/Gnosis/data/merged_qa_dataset
+    #   /mnt/vaultb/datasets/merged_qa_dataset
+    #   /merged_qa_dataset
     # -----------------------------
-    MERGED_PATH = "/merged_qa_dataset"
+    MERGED_PATH = getattr(training_args, "dataset_path", None)
+    if not MERGED_PATH:
+        raise ValueError(
+            "dataset_path is not set! Add `dataset_path: /path/to/your/dataset` "
+            "to your YAML recipe (e.g., Llama-3.1-8B_gnosis.yaml)."
+        )
+    if not os.path.exists(MERGED_PATH):
+        raise FileNotFoundError(
+            f"dataset_path not found on disk: {MERGED_PATH}\n"
+            "Please verify the path and update your YAML recipe accordingly.\n"
+            "Candidate locations to check on the server:\n"
+            "  ls /mnt/vaultb/Aditya_Manik/Gnosis/data/\n"
+            "  ls /mnt/vaultb/datasets/\n"
+            "  ls /"
+        )
+    logger.info(f"Loading dataset from: {MERGED_PATH}")
     raw = load_from_disk(MERGED_PATH)
 
     SEED = getattr(training_args, "seed", 42)
